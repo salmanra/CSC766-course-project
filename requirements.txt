@@ -2,3 +2,11 @@ fastapi
 uvicorn
 requests
 Pillow
+ruff
+bandit
+
+# [local-llm] optional — only needed if you switch the summarizer to
+# --backend local. Install with:
+#     pip install transformers torch accelerate
+# and fill in LocalLLMBackend.generate_review in
+# server/code_review/llm_backend.py.
