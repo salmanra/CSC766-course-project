@@ -5,6 +5,59 @@ inefficiency pattern. Basic and Optimized versions share the same servers and
 input corpus, so the delta between them isolates the effect of each
 optimization.
 
+## Hardware setup
+
+| Component       | Spec                                                                 |
+|-----------------|----------------------------------------------------------------------|
+| **CPU**         | 13th Gen Intel Core i9-13900F — 24 cores / 32 threads, max 5.6 GHz, 36 MiB L3 |
+| **GPU**         | NVIDIA GeForce RTX 4090 — 24 GB GDDR6X, compute capability 8.9       |
+| **GPU driver**  | 555.42.02                                                            |
+| **CUDA**        | 12.5 (runtime + `nvcc` 12.5.82)                                      |
+| **RAM**         | 62 GiB DDR5                                                          |
+| **OS / kernel** | Ubuntu 22.04.5 LTS, Linux 6.8.0-85-generic (x86_64)                  |
+| **Python**      | 3.10.12                                                              |
+
+### Python package versions (project venv at `env/`)
+
+| Package         | Version  | Source                  | Used for                                  |
+|-----------------|----------|-------------------------|-------------------------------------------|
+| `fastapi`       | 0.136.1  | `requirements.txt`      | All four tool servers                     |
+| `uvicorn`       | 0.46.0   | `requirements.txt`      | ASGI server for FastAPI                   |
+| `pydantic`      | 2.13.3   | `requirements.txt` (transitive) | Request models in `_shared.py`    |
+| `requests`      | 2.33.1   | `requirements.txt`      | Client → server HTTP                      |
+| `Pillow`        | 12.2.0   | `requirements.txt`      | Image dep carried over from base profiler |
+| `ruff`          | 0.15.12  | `requirements.txt`      | Linter subprocess (`tool.lint`)           |
+| `bandit`        | 1.9.4    | `requirements.txt`      | Security scanner subprocess (`tool.scan`) |
+| `torch`         | optional | `requirements-llm.txt`  | LocalLLMBackend (`--backend local`) only  |
+| `transformers`  | optional | `requirements-llm.txt`  | LocalLLMBackend tokenizer + model         |
+| `accelerate`    | optional | `requirements-llm.txt`  | LocalLLMBackend device placement          |
+
+```bash
+python3.10 -m venv env
+env/bin/pip install -r requirements.txt
+# Optional, for the CUDA LLM backend only:
+env/bin/pip install -r requirements-llm.txt
+```
+
+## LLM model (LocalLLMBackend)
+
+| Field             | Value                                                              |
+|-------------------|--------------------------------------------------------------------|
+| Model ID          | `Qwen/Qwen2.5-Coder-0.5B-Instruct`                                 |
+| Family / size     | Qwen 2.5 Coder, 0.5 B parameters                                   |
+| License           | Apache 2.0                                                         |
+| Loaded as         | `torch.float16` via `transformers.AutoModelForCausalLM`            |
+| Device placement  | `device_map="cuda"` (single 4090; ~1 GB VRAM at fp16)              |
+| Generation config | `max_new_tokens=256`, `do_sample=False`                            |
+| Override          | `CODE_REVIEW_LLM_MODEL=...` env var                                |
+
+Lazy-loaded on the first `/summarize` request, then resident for the
+process lifetime. On any failure (no CUDA, missing dependency, OOM,
+download error) `LocalLLMBackend` falls back to `TemplateBackend` and
+tags the EXEC_OP record with `extra.llm_fallback_reason`. The headline
+numbers in *Measured performance* below were produced with
+`TemplateBackend`.
+
 ## Workflow
 
 ```
@@ -19,47 +72,31 @@ optimization.
 
 Four independently-deployed FastAPI services:
 
-| Service       | Port | Backed by                          |
-|---------------|------|------------------------------------|
-| parser        | 8101 | Python stdlib `ast`                |
-| linter        | 8102 | `ruff check --output-format=json`  |
-| scanner       | 8103 | `bandit -f json` (via tempfile)    |
-| summarizer    | 8104 | `TemplateBackend` (default) or `LocalLLMBackend` (stub) |
+| Service       | Port | Backed by                                            |
+|---------------|------|------------------------------------------------------|
+| parser        | 8101 | Python stdlib `ast`                                  |
+| linter        | 8102 | `ruff check --output-format=json`                    |
+| scanner       | 8103 | `bandit -f json` (via tempfile)                      |
+| summarizer    | 8104 | `TemplateBackend` (default) or `LocalLLMBackend`     |
 
-All four services emit `EXEC_OP` records to
-`profiler_logs/code_review_exec_ops.jsonl` via the shared
-`profiler_utils.build_exec_op_record` helper.
+Every service emits `EXEC_OP` records to
+`profiler_logs/code_review_exec_ops.jsonl` via
+`profiler_utils.build_exec_op_record`.
 
 ## The Basic version
 
-The Basic client implements the workflow as a straightforward sequential
-pipeline. The client calls the parser, hands the
-resulting AST on to the linter and scanner, reparses the source before
-summarizing so the downstream call sees a freshly validated tree, and waits
-for all results before invoking the summarizer. The linter and scanner
-return both structured diagnostics and pretty human-readable renderings;
-the client keeps the structured fields and uses them to build the summary.
+A sequential pipeline that exhibits four inefficiency patterns:
 
-Here are some ways this workflow leaves performance on the table:
-
-1. **Redundant invocation** — the parser is called twice per request, once
-   at the start of the workflow and once as a pre-summarize validation
-   pass, performing identical work for the same source.
-2. **Dead output** — the linter's `full_report_text` and the scanner's
-   `cwe_refs` are computed and transmitted on every call but are never used
-   downstream.
-3. **Unnecessary round-trip** — the full serialized AST returned by the
-   parser is uploaded again to the linter and the scanner on the next hop,
-   inflating request bodies by several KB per call.
-4. **Control-flow branching** — the approve / request_changes decision
-   depends on lint + scan results, so the summarizer is serialized behind
-   both even though the decision usually points in a predictable direction
-   from a quick look at the source.
+1. **Redundant invocation** — parser called twice per request (once at
+   the start, once as a pre-summarize validation pass).
+2. **Dead output** — linter's `full_report_text` and scanner's
+   `cwe_refs` transmitted on every call but unused downstream.
+3. **Unnecessary round-trip** — full serialized AST shuttled from parser
+   to linter and scanner via the client on every hop.
+4. **Control-flow branching** — summarizer serialized behind lint + scan
+   even when the action is predictable from the source.
 
 ## The Optimized version
-
-The Optimized client applies four ToolIR-style optimizations that together
-address every pattern above:
 
 | #  | Optimization                        | Pattern fixed                    |
 |----|-------------------------------------|----------------------------------|
@@ -68,25 +105,18 @@ address every pattern above:
 | O3 | Client-side `parse` memo by SHA-256 | Redundant invocation             |
 | O4 | Cheap guard + speculative summarize | Control-flow branching (bonus)   |
 
-- **O1 — AST by reference, not by value.** The parser's response carries a
-  content-addressed `ast_id`. The linter and scanner accept `{source,
-  ast_id}` and, when no inline `ast_json` is supplied, fetch the AST
-  directly from the parser via `GET /ast/{ast_id}` instead of receiving it
-  through the client.
-- **O2 — trim responses to what callers actually use.** Both linter and
-  scanner honor a `?fields=...` query parameter so callers can opt out of
-  the verbose human-readable outputs (`full_report_text`, `cwe_refs`) they
-  don't consume.
-- **O3 — client-side parse memo.** The optimized client caches parser
-  responses keyed by `sha256(source)`. The pre-summarize validation call
-  becomes a cache hit and emits a client-side `EXEC_OP` with
+- **O1.** Parser response carries a content-addressed `ast_id`. Linter
+  and scanner accept `{source, ast_id}` and fetch the AST directly via
+  `GET /ast/{ast_id}`.
+- **O2.** Linter and scanner honor `?fields=...` so callers can skip
+  `full_report_text` and `cwe_refs`.
+- **O3.** Optimized client caches parser responses keyed by
+  `sha256(source)`. Hits emit a client-side `EXEC_OP` with
   `cache_hit=true`.
-- **O4 — speculative execution (bonus).** A cheap guard runs a regex / LOC
-  heuristic on the source and predicts the likely `action` before lint and
-  scan finish. The summarizer is fired in parallel with lint + scan using
-  placeholder summaries. When the guard and the real outputs agree, the
-  speculative review is kept; when they disagree, the client rolls back and
-  re-issues `summarize` with the real findings, logging the outcome as a
+- **O4.** A regex / lines-of-code guard predicts the action before lint
+  and scan finish; summarize fires in parallel against placeholder
+  summaries. On match, the speculative review is kept; on mismatch, the
+  client re-issues `summarize` with real findings, logging
   `speculation_hit` or `rollback`.
 
 ## Repository layout
@@ -98,17 +128,17 @@ server/code_review/
   linter_server.py      — :8102  POST /lint?fields=...
   scanner_server.py     — :8103  POST /scan?fields=...
   summarizer_server.py  — :8104  POST /summarize
-  llm_backend.py        — TemplateBackend (default) + LocalLLMBackend (stub)
+  llm_backend.py        — TemplateBackend (default) + LocalLLMBackend
 client/code_review/
   basic_client.py       — unoptimized sequential pipeline
   optimized_client.py   — O1 + O2 + O3 + O4
 analysis/code_review/
   parse_and_compare.py  — trace analyzer + speedup / speculation breakdown
-inputs/code_review/     — 8 curated Python files (hits, misses, rollbacks)
-inputs/code_review/large/ — 6 cpython stdlib files, ~11k LOC, latency-scaling corpus
+inputs/code_review/     — 8 curated Python files
+inputs/code_review/large/ — 6 cpython stdlib files, ~11k LOC
 scripts/code_review/
   run_all_servers.sh    — launch all four services with trap cleanup
-profiler_utils.py       — shared EXEC_OP schema (do not duplicate)
+profiler_utils.py       — shared EXEC_OP schema
 profiler_logs/code_review_exec_ops.jsonl  — appended by every run
 ```
 
@@ -121,15 +151,11 @@ pip install -r requirements.txt
 # Installs: fastapi, uvicorn, requests, Pillow, ruff, bandit
 ```
 
-Optional: to experiment with a local LLM backend, install the extras and fill
-in `LocalLLMBackend.generate_review` in `server/code_review/llm_backend.py`:
+Optional CUDA backend dependencies:
 
 ```bash
-pip install transformers torch accelerate
+pip install -r requirements-llm.txt   # transformers, torch, accelerate
 ```
-
-The stub raises `NotImplementedError` until you implement it; no other file
-needs to change to swap backends.
 
 ## How to run
 
@@ -141,8 +167,8 @@ bash scripts/code_review/run_all_servers.sh
 ```
 
 Override any port with `PARSER_PORT=... LINTER_PORT=... ... bash scripts/...`.
-Use `--backend local` (or `SUMMARIZER_BACKEND=local`) once the LLM stub is
-filled in.
+Use `--backend local` (or `SUMMARIZER_BACKEND=local`) to switch the
+summarizer to `LocalLLMBackend`.
 
 ### Run the Basic version
 
@@ -166,8 +192,7 @@ python client/code_review/optimized_client.py --all --runs 5 \
 
 `--corpus-dir <path>` lets `--all` glob any directory; the default is the
 small curated corpus. To keep the small- and large-corpus traces in
-separate logs, set the `CODE_REVIEW_EXEC_OPS_LOG` environment variable
-on both servers and clients (see "Measured performance" below).
+separate logs, set `CODE_REVIEW_EXEC_OPS_LOG` on both servers and clients.
 
 ### Analyze traces
 
@@ -177,18 +202,15 @@ python analysis/code_review/parse_and_compare.py \
   --log profiler_logs/code_review_exec_ops_large.jsonl
 ```
 
-Traces are appended (not overwritten) to
-`profiler_logs/code_review_exec_ops.jsonl` by default; override with the
-`CODE_REVIEW_EXEC_OPS_LOG` env var.
+Traces are appended (not overwritten); override the log path with
+`CODE_REVIEW_EXEC_OPS_LOG`.
 
 ## Inputs corpus
 
-Two corpora ship with the benchmark:
-
 ### Small curated corpus (`inputs/code_review/`)
 
-Eight small Python files curated so the cheap guard has a visible hit / miss
-/ rollback profile:
+Eight Python files curated so the cheap guard has a 50 % hit rate over a
+mix of hits, misses, and rollbacks:
 
 | File                        | Real outcome      | Guard prediction  | Outcome   |
 |-----------------------------|-------------------|-------------------|-----------|
@@ -201,19 +223,12 @@ Eight small Python files curated so the cheap guard has a visible hit / miss
 | `subtle_security.py`        | request_changes   | approve           | rollback  |
 | `empty.py`                  | approve           | approve           | hit       |
 
-The rollback cases are what the course project's speculation analysis
-("under what conditions is speculation beneficial?") needs to be meaningful.
-
 ### Large corpus (`inputs/code_review/large/`)
 
 Six unmodified files copied from the CPython 3.10 standard library,
-totaling 10 988 LOC, used to make the latency-speedup story defensible.
-At this scale `ruff` and `bandit` each take 100 + ms per file and the
-serialized AST exceeds 100 KB, so the savings from O1 (round-trip) and
-O3 (parse memo) translate into wall-clock latency reductions instead of
-just byte-traffic reductions.
+totaling 10 988 lines of code:
 
-| File             | LOC   | Source path in CPython 3.10  |
+| File             | Lines | Source path in CPython 3.10  |
 |------------------|------:|------------------------------|
 | `functools.py`   |   992 | `/usr/lib/python3.10/functools.py`   |
 | `dataclasses.py` |  1453 | `/usr/lib/python3.10/dataclasses.py` |
@@ -222,17 +237,10 @@ just byte-traffic reductions.
 | `difflib.py`     |  2056 | `/usr/lib/python3.10/difflib.py`     |
 | `inspect.py`     |  3317 | `/usr/lib/python3.10/inspect.py`     |
 
-These files are PSF-licensed; provenance and a regeneration command are
-recorded in `inputs/code_review/large/NOTICE.txt`.
+Provenance and a regeneration command are recorded in
+`inputs/code_review/large/NOTICE.txt`.
 
 ## Measured performance
-
-Two corpora, each with its own purpose:
-
-- **Small curated corpus** (`inputs/code_review/`, 8 files, 350 LOC) — designed for the speculation analysis. The 8 files give the cheap guard a 50 % hit rate with a mix of hits, misses, and rollbacks, so the speculation E[C] math (below) has meaningful data.
-- **Large corpus** (`inputs/code_review/large/`, 6 cpython stdlib files, ~11 000 LOC) — designed to make the latency-speedup story defensible. Real-sized inputs push baseline ruff + bandit cost into the 100–300 ms range, where the byte-traffic savings from O1 / O2 actually translate into wall-clock latency wins.
-
-Reproduce both with:
 
 ```bash
 # Small curated corpus
@@ -249,8 +257,6 @@ CODE_REVIEW_EXEC_OPS_LOG=profiler_logs/code_review_exec_ops_large.jsonl \
   python client/code_review/optimized_client.py --all --runs 5 --corpus-dir inputs/code_review/large
 python analysis/code_review/parse_and_compare.py --log profiler_logs/code_review_exec_ops_large.jsonl
 ```
-
-`CODE_REVIEW_EXEC_OPS_LOG` reroutes every server- and client-emitted EXEC_OP record to a separate JSONL so the two corpora's traces don't mix.
 
 ### Headline — Small curated corpus (5 runs × 8 inputs = 40 traces / mode)
 
@@ -271,9 +277,7 @@ End-to-end speedup: **1.13×** (10 ms absolute).
 | O3 redundant invocations                    | 40 duplicate (op, args_hash) pairs | 72 cache hits | second parse + cross-run repeats served locally |
 | O4 speculation                              | —        | 50 % hit rate | observed E[C] = 76 ms |
 
-On this corpus `ruff` and `bandit` subprocesses dominate wall-clock (~60–80 ms per invocation) and the input files are tiny, so O1 and O2 show up primarily as byte-traffic savings rather than latency savings. O3 and O4 drive the latency win.
-
-### Headline — Large corpus (5 runs × 6 cpython files = 30 traces / mode, 10 988 LOC total)
+### Headline — Large corpus (5 runs × 6 cpython files = 30 traces / mode, 10 988 lines total)
 
 | Metric                          | Basic         | Optimized     | Reduction |
 |---------------------------------|---------------|---------------|-----------|
@@ -290,19 +294,9 @@ End-to-end speedup: **1.22×** (31 ms absolute).
 | O1 round-trip (lint + scan request bytes)   | 13.75 MB | 3.93 MB | 71.4 % fewer request bytes (~9.8 MB removed across the run) |
 | O2 dead-output (lint + scan response bytes) | 135.1 KB | 85.2 KB | 36.9 % fewer response bytes |
 | O3 redundant invocations                    | 30 duplicate (op, args_hash) pairs | 54 cache hits | within-run + within-trace repeats served locally |
-| O4 speculation                              | —        | 100 % hit rate | every large file trips the LOC>200 guard and bandit always finds something, so guard and real action agree on every trace |
-
-On this corpus the AST round-trip alone removes ~9.8 MB of duplicated payload across 30 traces — that's the dominant absolute saving — and the latency speedup grows from 1.13× to 1.22× as ruff and bandit each take 100 + ms to chew on real-sized files. The 100 % speculation hit rate on the large corpus is *not* a sign the guard is unusually accurate; it's a corpus property. Every file is over the 200 LOC threshold (so the guard always predicts `request_changes`), and bandit always finds at least one issue in real-world stdlib code (so the real action also resolves to `request_changes`). Speculation diversity is studied on the small corpus, which is purpose-built for it.
+| O4 speculation                              | —        | 100 % hit rate | every large file trips the guard's 200-line threshold and bandit always finds an issue, so guard and real action agree on every trace |
 
 ### Speculation analysis (bonus, small corpus)
-
-The speculation analysis runs on the small curated corpus, where the
-guard hit rate is 50 % by design (see the input table above). On the
-large corpus every trace is a hit — fine for latency comparisons,
-useless for studying when speculation pays off.
-
-Three-way comparison of summarize-path policies, all measured on the same
-optimized run (40 traces, 50 % guard hit rate):
 
 | Policy                                | Latency (mean) | Notes |
 |---------------------------------------|---------------:|-------|
@@ -312,111 +306,29 @@ optimized run (40 traces, 50 % guard hit rate):
 
 - Guard hit rate (`p`): 50.0 %
 - Guard cost (`g`): < 1 ms (regex over source)
-- Rollback cost (measured per-trace, N=20): mean **1.8 ms**, median 2.0 ms, IQR 0.8 ms — wall-clock of the redo `summarize` call emitted as `rollback_cost_ms` on each rollback event, not a cross-trace mean of total walls.
+- Rollback cost (measured per-trace, N=20): mean **1.8 ms**, median 2.0 ms, interquartile range 0.8 ms — wall-clock of the redo `summarize` call recorded as `rollback_cost_ms` on each rollback event.
 - Speculative tokens wasted across all rollbacks: 460
 - Speculation savings vs always-expensive: ~1 ms (1.2 %)
 - Speculation savings vs basic: ~10 ms (11.3 %)
 
 Speculation is beneficial when
-`guard_cost + (1 − p) · rollback_cost < serial_summarize_latency`. With
-the deterministic template backend, summarize cost is tiny (~2 ms) so the
-50 % guard barely moves the needle vs. always-expensive (~1 % win) but
-*does* still beat the sequential basic policy (~11 % win) because
-speculation also lifts summarize off the critical path. Under a real LLM
-backend the serial summarize cost is much larger (typically 100s of ms
-even for a 0.5 B model), so the same hit rate becomes a substantial
-end-to-end win.
+`guard_cost + (1 − p) · rollback_cost < serial_summarize_latency`.
 
-#### How rollback cost is measured
+## Reproducibility notes
 
-Each rollback in the optimized client records the wall-clock duration of
-the *redo* `summarize` call directly into the EXEC_OP record's
-`extra.rollback_cost_ms`. The analyzer reports mean / median / IQR over
-those per-trace values and uses the mean to synthesize the
-always-expensive baseline. This avoids an earlier methodology — comparing
-aggregate wall-time between rollback-tagged and hit-tagged traces — that
-was confounded by per-input variance and floored to zero whenever
-optimized happened to win, hiding the real rollback penalty.
-
-## Hardware and reproducibility
-
-Performance numbers in this README were measured on:
-
-- **OS**: macOS 15.6 (Darwin 24.x)
-- **CPU**: Apple M4 (arm64, 10 cores)
-- **RAM**: 16 GB unified memory
-- **Python**: 3.14.4
-- **Tool versions**: `ruff` 0.15.11, `bandit` 1.9.4, FastAPI / uvicorn from
-  `requirements.txt`
-
-The benchmark runs end-to-end on any CPU-only host with Python 3.10+.
-
-The summarizer's `--backend local` path requires a **CUDA-enabled GPU**
-plus the optional dependencies in `requirements-llm.txt`. On any host
-without CUDA — including Apple Silicon (M1–M4), where PyTorch uses MPS
-rather than CUDA — `LocalLLMBackend` transparently falls back to
-`TemplateBackend` and the EXEC_OP record carries
-`extra.llm_fallback_reason`. The deterministic `template` backend is the
-default, so no GPU is needed to reproduce the headline numbers.
-
-Determinism notes:
-
-- All four tools (AST, ruff, bandit, TemplateBackend) are deterministic
-  for the same input; the only non-deterministic value per run is the
-  generated `trace_id`.
-- Logs are appended, not overwritten, so multiple runs combine in the
-  same JSONL. Delete the log or rotate it between experiments.
+- Runs end-to-end on any CPU-only host with Python 3.10+.
+- All four tools (AST, ruff, bandit, TemplateBackend) are deterministic for the same input; only `trace_id` varies per run.
+- Logs are appended, not overwritten. Delete or rotate between experiments.
+- On hosts without CUDA — including Apple Silicon (M1–M4) — `LocalLLMBackend` falls back to `TemplateBackend`.
 
 ## EXEC_OP extensions used in this benchmark
 
-Every record follows the shared `profiler_utils.build_exec_op_record`
-schema. This benchmark also uses these `extra` fields:
+Every record follows the `profiler_utils.build_exec_op_record` schema.
+This benchmark adds these `extra` fields:
 
-- `client_mode: "basic" | "optimized"` — emitted once per workflow by the
-  client so the analyzer can classify the trace.
+- `client_mode: "basic" | "optimized"` — emitted once per workflow by the client.
 - `cache_hit: true` — client-side parse memo hit.
-- `speculation_hit: true` / `rollback: true` — outcome of the guard.
-- `guard_ms`, `guard_action`, `real_action`, `speculative_tokens_wasted` —
-  reported on every speculation event.
-- `rollback_cost_ms` — per-trace wall-clock of the redo `summarize` call,
-  emitted only on `rollback` events. Used by the analyzer to compute the
-  honest rollback cost and the always-expensive synthetic baseline.
-- `redundant_parse`, `dropped_full_report`, `dropped_cwe_refs` — emitted
-  server-side by linter / scanner so the analyzer can attribute bytes saved
-  to O1 and O2.
-
-## LLM backend (optional)
-
-`server/code_review/llm_backend.py` provides two backends behind the same
-`generate_review(...)` interface:
-
-- **`TemplateBackend`** — deterministic, zero-dependency default. Runs
-  everywhere, no GPU required.
-- **`LocalLLMBackend`** — runs a small open-source instruct model
-  (`Qwen/Qwen2.5-Coder-0.5B-Instruct` by default) on a CUDA device.
-  Detects CUDA at construction time via `has_cuda()`, lazy-loads the
-  model on first use, and on any failure (no CUDA, missing torch /
-  transformers, model download error, generation OOM) silently delegates
-  to `TemplateBackend`. The model ID is overridable without editing the
-  file:
-
-      export CODE_REVIEW_LLM_MODEL="Qwen/Qwen2.5-Coder-1.5B-Instruct"
-
-Select the backend at startup:
-
-```bash
-python server/code_review/summarizer_server.py --port 8104 --backend local
-# or, for the deterministic default
-python server/code_review/summarizer_server.py --port 8104 --backend template
-```
-
-To enable real model inference on a CUDA host:
-
-```bash
-pip install -r requirements-llm.txt   # transformers, torch, accelerate
-python server/code_review/summarizer_server.py --port 8104 --backend local
-```
-
-`requirements-llm.txt` is intentionally separate from base
-`requirements.txt` so the benchmark stays installable on hosts without
-GPU support.
+- `speculation_hit: true` / `rollback: true` — guard outcome.
+- `guard_ms`, `guard_action`, `real_action`, `speculative_tokens_wasted` — reported on every speculation event.
+- `rollback_cost_ms` — wall-clock of the redo `summarize` call, emitted only on `rollback` events.
+- `redundant_parse`, `dropped_full_report`, `dropped_cwe_refs` — emitted server-side by linter / scanner.
