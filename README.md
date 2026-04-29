@@ -105,6 +105,7 @@ client/code_review/
 analysis/code_review/
   parse_and_compare.py  — trace analyzer + speedup / speculation breakdown
 inputs/code_review/     — 8 curated Python files (hits, misses, rollbacks)
+inputs/code_review/large/ — 6 cpython stdlib files, ~11k LOC, latency-scaling corpus
 scripts/code_review/
   run_all_servers.sh    — launch all four services with trap cleanup
 profiler_utils.py       — shared EXEC_OP schema (do not duplicate)
@@ -148,6 +149,9 @@ filled in.
 ```bash
 python client/code_review/basic_client.py --input inputs/code_review/mixed.py
 python client/code_review/basic_client.py --all --runs 5
+# Large corpus
+python client/code_review/basic_client.py --all --runs 5 \
+  --corpus-dir inputs/code_review/large
 ```
 
 ### Run the Optimized version
@@ -155,18 +159,33 @@ python client/code_review/basic_client.py --all --runs 5
 ```bash
 python client/code_review/optimized_client.py --input inputs/code_review/mixed.py
 python client/code_review/optimized_client.py --all --runs 5
+# Large corpus
+python client/code_review/optimized_client.py --all --runs 5 \
+  --corpus-dir inputs/code_review/large
 ```
+
+`--corpus-dir <path>` lets `--all` glob any directory; the default is the
+small curated corpus. To keep the small- and large-corpus traces in
+separate logs, set the `CODE_REVIEW_EXEC_OPS_LOG` environment variable
+on both servers and clients (see "Measured performance" below).
 
 ### Analyze traces
 
 ```bash
 python analysis/code_review/parse_and_compare.py
+python analysis/code_review/parse_and_compare.py \
+  --log profiler_logs/code_review_exec_ops_large.jsonl
 ```
 
 Traces are appended (not overwritten) to
-`profiler_logs/code_review_exec_ops.jsonl`.
+`profiler_logs/code_review_exec_ops.jsonl` by default; override with the
+`CODE_REVIEW_EXEC_OPS_LOG` env var.
 
 ## Inputs corpus
+
+Two corpora ship with the benchmark:
+
+### Small curated corpus (`inputs/code_review/`)
 
 Eight small Python files curated so the cheap guard has a visible hit / miss
 / rollback profile:
@@ -185,19 +204,55 @@ Eight small Python files curated so the cheap guard has a visible hit / miss
 The rollback cases are what the course project's speculation analysis
 ("under what conditions is speculation beneficial?") needs to be meaningful.
 
+### Large corpus (`inputs/code_review/large/`)
+
+Six unmodified files copied from the CPython 3.10 standard library,
+totaling 10 988 LOC, used to make the latency-speedup story defensible.
+At this scale `ruff` and `bandit` each take 100 + ms per file and the
+serialized AST exceeds 100 KB, so the savings from O1 (round-trip) and
+O3 (parse memo) translate into wall-clock latency reductions instead of
+just byte-traffic reductions.
+
+| File             | LOC   | Source path in CPython 3.10  |
+|------------------|------:|------------------------------|
+| `functools.py`   |   992 | `/usr/lib/python3.10/functools.py`   |
+| `dataclasses.py` |  1453 | `/usr/lib/python3.10/dataclasses.py` |
+| `pathlib.py`     |  1461 | `/usr/lib/python3.10/pathlib.py`     |
+| `ast.py`         |  1709 | `/usr/lib/python3.10/ast.py`         |
+| `difflib.py`     |  2056 | `/usr/lib/python3.10/difflib.py`     |
+| `inspect.py`     |  3317 | `/usr/lib/python3.10/inspect.py`     |
+
+These files are PSF-licensed; provenance and a regeneration command are
+recorded in `inputs/code_review/large/NOTICE.txt`.
+
 ## Measured performance
 
-Numbers below are from 5 runs × 8 inputs = 40 traces per mode on the
-hardware listed in the next section. Reproduce with:
+Two corpora, each with its own purpose:
+
+- **Small curated corpus** (`inputs/code_review/`, 8 files, 350 LOC) — designed for the speculation analysis. The 8 files give the cheap guard a 50 % hit rate with a mix of hits, misses, and rollbacks, so the speculation E[C] math (below) has meaningful data.
+- **Large corpus** (`inputs/code_review/large/`, 6 cpython stdlib files, ~11 000 LOC) — designed to make the latency-speedup story defensible. Real-sized inputs push baseline ruff + bandit cost into the 100–300 ms range, where the byte-traffic savings from O1 / O2 actually translate into wall-clock latency wins.
+
+Reproduce both with:
 
 ```bash
+# Small curated corpus
 rm -f profiler_logs/code_review_exec_ops.jsonl
 python client/code_review/basic_client.py     --all --runs 5
 python client/code_review/optimized_client.py --all --runs 5
 python analysis/code_review/parse_and_compare.py
+
+# Large corpus (cpython subset)
+rm -f profiler_logs/code_review_exec_ops_large.jsonl
+CODE_REVIEW_EXEC_OPS_LOG=profiler_logs/code_review_exec_ops_large.jsonl \
+  python client/code_review/basic_client.py     --all --runs 5 --corpus-dir inputs/code_review/large
+CODE_REVIEW_EXEC_OPS_LOG=profiler_logs/code_review_exec_ops_large.jsonl \
+  python client/code_review/optimized_client.py --all --runs 5 --corpus-dir inputs/code_review/large
+python analysis/code_review/parse_and_compare.py --log profiler_logs/code_review_exec_ops_large.jsonl
 ```
 
-### Headline (Basic vs Optimized)
+`CODE_REVIEW_EXEC_OPS_LOG` reroutes every server- and client-emitted EXEC_OP record to a separate JSONL so the two corpora's traces don't mix.
+
+### Headline — Small curated corpus (5 runs × 8 inputs = 40 traces / mode)
 
 | Metric                          | Basic       | Optimized | Reduction |
 |---------------------------------|-------------|-----------|-----------|
@@ -205,9 +260,9 @@ python analysis/code_review/parse_and_compare.py
 | Client RPC calls (total)        | 200         | 148       | 26.0 %    |
 | Bytes transferred (mean / trace)| 29.4 KB     | 6.8 KB    | 76.7 %    |
 
-End-to-end speedup: **1.13×**.
+End-to-end speedup: **1.13×** (10 ms absolute).
 
-### Per-optimization breakdown
+#### Per-optimization breakdown (small corpus)
 
 | Optimization  | Before    | After    | Effect                        |
 |---------------|-----------|----------|-------------------------------|
@@ -216,11 +271,35 @@ End-to-end speedup: **1.13×**.
 | O3 redundant invocations                    | 40 duplicate (op, args_hash) pairs | 72 cache hits | second parse + cross-run repeats served locally |
 | O4 speculation                              | —        | 50 % hit rate | observed E[C] = 76 ms |
 
-Note: `ruff` and `bandit` subprocesses dominate wall-clock (~60–80 ms per
-invocation), so O1 and O2 show up primarily as byte-traffic savings rather
-than latency savings. O3 and O4 drive the latency win.
+On this corpus `ruff` and `bandit` subprocesses dominate wall-clock (~60–80 ms per invocation) and the input files are tiny, so O1 and O2 show up primarily as byte-traffic savings rather than latency savings. O3 and O4 drive the latency win.
 
-### Speculation analysis (bonus)
+### Headline — Large corpus (5 runs × 6 cpython files = 30 traces / mode, 10 988 LOC total)
+
+| Metric                          | Basic         | Optimized     | Reduction |
+|---------------------------------|---------------|---------------|-----------|
+| End-to-end latency (mean ± std) | 173 ± 45 ms   | 142 ± 31 ms   | 17.8 %    |
+| Client RPC calls (total)        | 150           | 96            | 36.0 %    |
+| Bytes transferred (mean / trace)| 1015.8 KB     | 251.6 KB      | 75.2 %    |
+
+End-to-end speedup: **1.22×** (31 ms absolute).
+
+#### Per-optimization breakdown (large corpus)
+
+| Optimization  | Before    | After    | Effect                        |
+|---------------|-----------|----------|-------------------------------|
+| O1 round-trip (lint + scan request bytes)   | 13.75 MB | 3.93 MB | 71.4 % fewer request bytes (~9.8 MB removed across the run) |
+| O2 dead-output (lint + scan response bytes) | 135.1 KB | 85.2 KB | 36.9 % fewer response bytes |
+| O3 redundant invocations                    | 30 duplicate (op, args_hash) pairs | 54 cache hits | within-run + within-trace repeats served locally |
+| O4 speculation                              | —        | 100 % hit rate | every large file trips the LOC>200 guard and bandit always finds something, so guard and real action agree on every trace |
+
+On this corpus the AST round-trip alone removes ~9.8 MB of duplicated payload across 30 traces — that's the dominant absolute saving — and the latency speedup grows from 1.13× to 1.22× as ruff and bandit each take 100 + ms to chew on real-sized files. The 100 % speculation hit rate on the large corpus is *not* a sign the guard is unusually accurate; it's a corpus property. Every file is over the 200 LOC threshold (so the guard always predicts `request_changes`), and bandit always finds at least one issue in real-world stdlib code (so the real action also resolves to `request_changes`). Speculation diversity is studied on the small corpus, which is purpose-built for it.
+
+### Speculation analysis (bonus, small corpus)
+
+The speculation analysis runs on the small curated corpus, where the
+guard hit rate is 50 % by design (see the input table above). On the
+large corpus every trace is a hit — fine for latency comparisons,
+useless for studying when speculation pays off.
 
 Three-way comparison of summarize-path policies, all measured on the same
 optimized run (40 traces, 50 % guard hit rate):

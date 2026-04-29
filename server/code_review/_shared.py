@@ -27,7 +27,7 @@ if REPO_ROOT not in sys.path:
 
 from profiler_utils import append_jsonl, build_exec_op_record  # noqa: E402
 
-EXEC_OPS_LOG = os.path.normpath(
+EXEC_OPS_LOG = os.environ.get("CODE_REVIEW_EXEC_OPS_LOG") or os.path.normpath(
     os.path.join(REPO_ROOT, "profiler_logs", "code_review_exec_ops.jsonl")
 )
 

@@ -1,0 +1,24 @@
+The .py files in this directory are unmodified copies of CPython 3.10
+standard-library modules, used here as a benchmark corpus. They are
+distributed under the Python Software Foundation License Version 2
+(https://docs.python.org/3/license.html).
+
+Files:
+  ast.py        — from /usr/lib/python3.10/ast.py
+  dataclasses.py — from /usr/lib/python3.10/dataclasses.py
+  difflib.py    — from /usr/lib/python3.10/difflib.py
+  functools.py  — from /usr/lib/python3.10/functools.py
+  inspect.py    — from /usr/lib/python3.10/inspect.py
+  pathlib.py    — from /usr/lib/python3.10/pathlib.py
+
+To regenerate from a Python 3.10 install:
+
+  for f in ast.py dataclasses.py difflib.py functools.py inspect.py pathlib.py; do
+    cp "$(python3.10 -c 'import sysconfig; print(sysconfig.get_paths()["stdlib"])')/$f" \
+       inputs/code_review/large/$f
+  done
+
+These files are used solely for the latency-scaling benchmark documented
+in the project README. The small curated corpus in the parent directory
+remains the speculation hit/miss/rollback corpus — that experimental
+design is unaffected by this directory.

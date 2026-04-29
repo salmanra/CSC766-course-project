@@ -47,7 +47,7 @@ from profiler_utils import (  # noqa: E402
 )
 
 
-EXEC_OPS_LOG = os.path.normpath(
+EXEC_OPS_LOG = os.environ.get("CODE_REVIEW_EXEC_OPS_LOG") or os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "..",
                  "profiler_logs", "code_review_exec_ops.jsonl")
 )
@@ -189,11 +189,13 @@ def run_workflow(
 # Runner
 # ---------------------------------------------------------------------------
 
-def resolve_inputs(input_arg: Optional[str], use_all: bool) -> List[str]:
+def resolve_inputs(
+    input_arg: Optional[str], use_all: bool, corpus_dir: str,
+) -> List[str]:
     if use_all:
-        files = sorted(glob.glob(os.path.join(INPUTS_DIR, "*.py")))
+        files = sorted(glob.glob(os.path.join(corpus_dir, "*.py")))
         if not files:
-            raise SystemExit(f"No inputs found in {INPUTS_DIR}")
+            raise SystemExit(f"No inputs found in {corpus_dir}")
         return files
     if not input_arg:
         raise SystemExit("Either --input <path> or --all is required.")
@@ -206,7 +208,10 @@ def main() -> None:
     p = argparse.ArgumentParser(description="code_review basic (unoptimized) client")
     p.add_argument("--input", help="Single input .py file.")
     p.add_argument("--all", action="store_true",
-                   help="Iterate every file in inputs/code_review/.")
+                   help="Iterate every .py file in --corpus-dir.")
+    p.add_argument("--corpus-dir", default=INPUTS_DIR,
+                   help=f"Directory globbed by --all. Default: {INPUTS_DIR}. "
+                   f"Use inputs/code_review/large for the scaled corpus.")
     p.add_argument("--runs", type=int, default=1,
                    help="Runs per input for latency stats (default 1).")
     for name, url in DEFAULTS.items():
@@ -214,7 +219,7 @@ def main() -> None:
     args = p.parse_args()
 
     urls = {name: getattr(args, f"{name}_url") for name in DEFAULTS}
-    inputs = resolve_inputs(args.input, args.all)
+    inputs = resolve_inputs(args.input, args.all, args.corpus_dir)
 
     print(f"EXEC_OP log: {EXEC_OPS_LOG}")
     print(f"Mode: BASIC (no optimizations)")
