@@ -137,6 +137,13 @@ def analyze_trace(trace_id: str, nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
                      for n in (spec_hits + rollbacks)]
     tokens_wasted = sum(int(_extra(n).get("speculative_tokens_wasted", 0) or 0)
                         for n in rollbacks)
+    # Per-trace rollback cost — the wall-clock of the redo summarize call,
+    # measured by the optimized client and emitted on rollback events. This
+    # is the honest cost the speculation policy paid that the basic policy
+    # did not, and is used in place of the old cross-trace mean difference.
+    rollback_cost_vals = [int(_extra(n).get("rollback_cost_ms", 0) or 0)
+                          for n in rollbacks
+                          if _extra(n).get("rollback_cost_ms") is not None]
 
     return {
         "trace_id": trace_id,
@@ -157,6 +164,7 @@ def analyze_trace(trace_id: str, nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
         "speculation_hits": len(spec_hits),
         "rollbacks": len(rollbacks),
         "guard_ms_values": guard_ms_vals,
+        "rollback_cost_values": rollback_cost_vals,
         "speculative_tokens_wasted": tokens_wasted,
     }
 
@@ -184,9 +192,22 @@ def aggregate(mode_traces: List[Dict[str, Any]]) -> Dict[str, Any]:
     total_rollbacks = sum(t["rollbacks"] for t in mode_traces)
     total_guard_runs = total_hits + total_rollbacks
     guard_ms_vals: List[int] = []
+    rollback_cost_vals: List[int] = []
     for t in mode_traces:
         guard_ms_vals.extend(t["guard_ms_values"])
+        rollback_cost_vals.extend(t.get("rollback_cost_values", []))
     guard_mean, _ = mean_std(guard_ms_vals)
+    rollback_cost_mean, rollback_cost_std = mean_std(rollback_cost_vals)
+    if rollback_cost_vals:
+        rollback_cost_median = statistics.median(rollback_cost_vals)
+        if len(rollback_cost_vals) >= 4:
+            qs = statistics.quantiles(rollback_cost_vals, n=4)
+            rollback_cost_iqr = qs[2] - qs[0]
+        else:
+            rollback_cost_iqr = max(rollback_cost_vals) - min(rollback_cost_vals)
+    else:
+        rollback_cost_median = 0.0
+        rollback_cost_iqr = 0.0
 
     return {
         "trace_count": len(mode_traces),
@@ -208,6 +229,12 @@ def aggregate(mode_traces: List[Dict[str, Any]]) -> Dict[str, Any]:
         "rollbacks": total_rollbacks,
         "hit_rate": (total_hits / total_guard_runs) if total_guard_runs else 0.0,
         "guard_ms_mean": guard_mean,
+        "rollback_cost_values": rollback_cost_vals,
+        "rollback_cost_mean": rollback_cost_mean,
+        "rollback_cost_std": rollback_cost_std,
+        "rollback_cost_median": rollback_cost_median,
+        "rollback_cost_iqr": rollback_cost_iqr,
+        "rollback_cost_n": len(rollback_cost_vals),
         "tokens_wasted": sum(t["speculative_tokens_wasted"] for t in mode_traces),
     }
 
@@ -226,11 +253,15 @@ def compute_always_expensive(
     the speculative one. We compute the per-trace synthetic wall as:
 
       * rollback trace  : wall_ms  (it already paid the rollback cost)
-      * hit trace       : wall_ms + rollback_extra (it would have paid it)
+      * hit trace       : wall_ms + rollback_cost (it would have paid it)
 
-    where ``rollback_extra`` is the mean wall-clock delta between rollback
-    and hit traces in the same optimized run. This reuses the existing
-    trace data; no extra benchmark runs are required.
+    ``rollback_cost`` is measured directly from rollback traces by the
+    optimized client (``rollback_cost_ms`` extra on each rollback EXEC_OP)
+    — i.e., the wall-clock duration of the redo summarize call. This is an
+    honest per-trace measurement, not a cross-trace mean of total wall
+    times (which is confounded by source-file size). No clipping at zero;
+    if the measurement is small or zero on a small sample, that's reported
+    as-is.
 
     The returned dict has the same shape as ``aggregate(...)`` so
     ``print_mode(...)`` can display it without changes.
@@ -238,20 +269,11 @@ def compute_always_expensive(
     if not opt_traces:
         return {}
 
-    rollback_traces = [t for t in opt_traces if t["rollbacks"] > 0]
-    hit_traces = [t for t in opt_traces if t["speculation_hits"] > 0]
-
-    if rollback_traces and hit_traces:
-        rollback_extra = max(
-            0.0,
-            statistics.mean(t["wall_ms"] for t in rollback_traces)
-            - statistics.mean(t["wall_ms"] for t in hit_traces),
-        )
-    else:
-        rollback_extra = 0.0
+    base = aggregate(opt_traces)
+    rollback_cost = base.get("rollback_cost_mean", 0.0) or 0.0
 
     synth_walls = [
-        t["wall_ms"] + (rollback_extra if t["speculation_hits"] > 0 else 0)
+        t["wall_ms"] + (rollback_cost if t["speculation_hits"] > 0 else 0)
         for t in opt_traces
     ]
     if len(synth_walls) > 1:
@@ -266,10 +288,9 @@ def compute_always_expensive(
     # Bytes / RPC counts don't change in the always-expensive synthesis —
     # only the wall-clock latency does. So we copy the optimized aggregate
     # and override the wall fields.
-    base = aggregate(opt_traces)
     base["wall_mean"] = wall_mean
     base["wall_std"] = wall_std
-    base["rollback_extra_synth"] = rollback_extra
+    base["rollback_extra_synth"] = rollback_cost
     return base
 
 
@@ -422,16 +443,27 @@ def main() -> None:
         # E[C] = p*fast + (1-p)*(fast+rollback)
         # observed_optimized ≈ E[C]; always_expensive = fast + rollback (worst).
         hit_rate = opt_agg["hit_rate"]
-        rollback_extra = ae_agg.get("rollback_extra_synth", 0.0) if ae_agg else 0.0
+        rollback_n = opt_agg.get("rollback_cost_n", 0)
+        rollback_mean = opt_agg.get("rollback_cost_mean", 0.0)
+        rollback_median = opt_agg.get("rollback_cost_median", 0.0)
+        rollback_iqr = opt_agg.get("rollback_cost_iqr", 0.0)
         print("=== Speculation analysis (E[C]) ===")
         print(f"  hit_rate (p):             {hit_rate*100:.1f}%")
         print(f"  guard cost (g):           {opt_agg['guard_ms_mean']:.1f}ms")
         print(f"  observed optimized E[C]:  {opt_agg['wall_mean']:.0f}ms")
-        print(f"  rollback extra latency:   {rollback_extra:.0f}ms")
+        if rollback_n > 0:
+            print(f"  rollback cost (measured): "
+                  f"mean={rollback_mean:.1f}ms  "
+                  f"median={rollback_median:.1f}ms  "
+                  f"IQR={rollback_iqr:.1f}ms  (N={rollback_n})")
+            print(f"    (per-trace wall-clock of the redo summarize call)")
+        else:
+            print(f"  rollback cost (measured): n/a (no rollback traces)")
         if ae_agg:
-            saved = max(0.0, ae_agg["wall_mean"] - opt_agg["wall_mean"])
-            print(f"  always-expensive cost:    {ae_agg['wall_mean']:.0f}ms")
-            print(f"  speculation savings:      {saved:.0f}ms vs always-expensive "
+            saved = ae_agg["wall_mean"] - opt_agg["wall_mean"]
+            print(f"  always-expensive cost:    {ae_agg['wall_mean']:.0f}ms  "
+                  f"(synthesized using measured rollback cost)")
+            print(f"  speculation savings:      {saved:+.0f}ms vs always-expensive "
                   f"({pct_reduction(ae_agg['wall_mean'], opt_agg['wall_mean']):.1f}%)")
         print(f"  basic (sequential):       {basic_agg['wall_mean']:.0f}ms")
         print()

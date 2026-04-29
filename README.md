@@ -201,20 +201,20 @@ python analysis/code_review/parse_and_compare.py
 
 | Metric                          | Basic       | Optimized | Reduction |
 |---------------------------------|-------------|-----------|-----------|
-| End-to-end latency (mean ± std) | 87 ± 14 ms  | 78 ± 4 ms | 10.4 %    |
+| End-to-end latency (mean ± std) | 86 ± 10 ms  | 76 ± 6 ms | 11.3 %    |
 | Client RPC calls (total)        | 200         | 148       | 26.0 %    |
-| Bytes transferred (mean / trace)| 26.7 KB     | 6.7 KB    | 74.9 %    |
+| Bytes transferred (mean / trace)| 29.4 KB     | 6.8 KB    | 76.7 %    |
 
-End-to-end speedup: **1.12×**.
+End-to-end speedup: **1.13×**.
 
 ### Per-optimization breakdown
 
 | Optimization  | Before    | After    | Effect                        |
 |---------------|-----------|----------|-------------------------------|
-| O1 round-trip (lint + scan request bytes)   | 479.6 KB | 94.1 KB | 80.4 % fewer request bytes |
+| O1 round-trip (lint + scan request bytes)   | 533.4 KB | 94.1 KB | 82.4 % fewer request bytes |
 | O2 dead-output (lint + scan response bytes) | 23.5 KB  | 14.8 KB | 37.1 % fewer response bytes |
 | O3 redundant invocations                    | 40 duplicate (op, args_hash) pairs | 72 cache hits | second parse + cross-run repeats served locally |
-| O4 speculation                              | —        | 50 % hit rate | observed E[C] = 78 ms |
+| O4 speculation                              | —        | 50 % hit rate | observed E[C] = 76 ms |
 
 Note: `ruff` and `bandit` subprocesses dominate wall-clock (~60–80 ms per
 invocation), so O1 and O2 show up primarily as byte-traffic savings rather
@@ -227,26 +227,37 @@ optimized run (40 traces, 50 % guard hit rate):
 
 | Policy                                | Latency (mean) | Notes |
 |---------------------------------------|---------------:|-------|
-| Basic (sequential wait-then-execute)  | 87 ms          | summarize serialized after lint + scan |
-| Optimized (speculation, observed E[C])| **78 ms**      | guard predicts; rollback only on miss |
-| Always-expensive (synthetic, every speculation rolls back) | 80 ms | Optimized + rollback_extra applied to every hit |
+| Basic (sequential wait-then-execute)  | 86 ms          | summarize serialized after lint + scan |
+| Optimized (speculation, observed E[C])| **76 ms**      | guard predicts; rollback only on miss |
+| Always-expensive (synthetic, every speculation rolls back) | 77 ms | Optimized + measured rollback cost applied to every hit |
 
 - Guard hit rate (`p`): 50.0 %
 - Guard cost (`g`): < 1 ms (regex over source)
-- Rollback extra latency: ~5 ms (observed mean delta between rollback and hit traces)
+- Rollback cost (measured per-trace, N=20): mean **1.8 ms**, median 2.0 ms, IQR 0.8 ms — wall-clock of the redo `summarize` call emitted as `rollback_cost_ms` on each rollback event, not a cross-trace mean of total walls.
 - Speculative tokens wasted across all rollbacks: 460
-- Speculation savings vs always-expensive: ~2 ms (2.9 %)
-- Speculation savings vs basic: ~9 ms (10.4 %)
+- Speculation savings vs always-expensive: ~1 ms (1.2 %)
+- Speculation savings vs basic: ~10 ms (11.3 %)
 
 Speculation is beneficial when
 `guard_cost + (1 − p) · rollback_cost < serial_summarize_latency`. With
-the deterministic template backend, summarize cost is tiny (~1 ms) so the
-50 % guard barely moves the needle vs. always-expensive (~3 % win) but
-*does* still beat the sequential basic policy (~10 % win) because
+the deterministic template backend, summarize cost is tiny (~2 ms) so the
+50 % guard barely moves the needle vs. always-expensive (~1 % win) but
+*does* still beat the sequential basic policy (~11 % win) because
 speculation also lifts summarize off the critical path. Under a real LLM
 backend the serial summarize cost is much larger (typically 100s of ms
 even for a 0.5 B model), so the same hit rate becomes a substantial
 end-to-end win.
+
+#### How rollback cost is measured
+
+Each rollback in the optimized client records the wall-clock duration of
+the *redo* `summarize` call directly into the EXEC_OP record's
+`extra.rollback_cost_ms`. The analyzer reports mean / median / IQR over
+those per-trace values and uses the mean to synthesize the
+always-expensive baseline. This avoids an earlier methodology — comparing
+aggregate wall-time between rollback-tagged and hit-tagged traces — that
+was confounded by per-input variance and floored to zero whenever
+optimized happened to win, hiding the real rollback penalty.
 
 ## Hardware and reproducibility
 
@@ -288,6 +299,9 @@ schema. This benchmark also uses these `extra` fields:
 - `speculation_hit: true` / `rollback: true` — outcome of the guard.
 - `guard_ms`, `guard_action`, `real_action`, `speculative_tokens_wasted` —
   reported on every speculation event.
+- `rollback_cost_ms` — per-trace wall-clock of the redo `summarize` call,
+  emitted only on `rollback` events. Used by the analyzer to compute the
+  honest rollback cost and the always-expensive synthetic baseline.
 - `redundant_parse`, `dropped_full_report`, `dropped_cwe_refs` — emitted
   server-side by linter / scanner so the analyzer can attribute bytes saved
   to O1 and O2.

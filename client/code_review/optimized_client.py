@@ -204,8 +204,20 @@ def emit_speculation_event(
     real_action: str,
     guard_ms: int,
     speculative_tokens: int,
+    rollback_cost_ms: Optional[int] = None,
 ) -> None:
     t = now_ms()
+    extra: Dict[str, Any] = {
+        kind: True,
+        "guard_action": guard_action,
+        "real_action": real_action,
+        "guard_ms": guard_ms,
+        "speculative_tokens_wasted": speculative_tokens if kind == "rollback" else 0,
+    }
+    if kind == "rollback" and rollback_cost_ms is not None:
+        # Measured wall-clock of the redo summarize call — the work the
+        # speculation policy paid for that the basic policy did not.
+        extra["rollback_cost_ms"] = int(rollback_cost_ms)
     record = build_exec_op_record(
         trace_id=trace_id,
         op="tool.speculation",
@@ -215,13 +227,7 @@ def emit_speculation_event(
         payload_in_bytes=0,
         payload_out_bytes=0,
         status_code=200,
-        extra={
-            kind: True,
-            "guard_action": guard_action,
-            "real_action": real_action,
-            "guard_ms": guard_ms,
-            "speculative_tokens_wasted": speculative_tokens if kind == "rollback" else 0,
-        },
+        extra=extra,
     )
     append_jsonl(EXEC_OPS_LOG, record)
 
@@ -333,6 +339,7 @@ def run_workflow(
             "severity_max": scan_resp.get("severity_max", "NONE"),
             "issues": scan_resp.get("issues", []),
         }
+        t_rollback_start = now_ms()
         sum_resp = post_json(
             f"{urls['summarizer']}/summarize",
             {
@@ -343,6 +350,7 @@ def run_workflow(
                 "node_id": "summarize_rollback",
             },
         )
+        rollback_cost_ms = now_ms() - t_rollback_start
         emit_speculation_event(
             trace_id=trace_id,
             kind="rollback",
@@ -350,6 +358,7 @@ def run_workflow(
             real_action=real_action,
             guard_ms=guard_ms,
             speculative_tokens=int(spec_result.get("tokens_out", 0) or 0),
+            rollback_cost_ms=rollback_cost_ms,
         )
 
     t_wall_end = now_ms()
