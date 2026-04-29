@@ -1,0 +1,13 @@
+# Optional LLM-only dependencies for the summarizer's --backend local path.
+# These are NOT required by the base benchmark, which runs end-to-end with
+# the deterministic TemplateBackend.
+#
+# Install only when you have a CUDA-enabled GPU and want LocalLLMBackend to
+# load and run a real model. On non-CUDA hosts the summarizer transparently
+# falls back to TemplateBackend regardless of whether these are installed.
+#
+#     pip install -r requirements-llm.txt
+#
+transformers
+torch
+accelerate

@@ -213,6 +213,67 @@ def aggregate(mode_traces: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Always-expensive (synthetic) baseline
+# ---------------------------------------------------------------------------
+
+def compute_always_expensive(
+    opt_traces: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Synthesize an "always-expensive" baseline from optimized trace data.
+
+    The always-expensive case models a speculation policy that always rolls
+    back — i.e., always pays the cost of issuing a real summarize call after
+    the speculative one. We compute the per-trace synthetic wall as:
+
+      * rollback trace  : wall_ms  (it already paid the rollback cost)
+      * hit trace       : wall_ms + rollback_extra (it would have paid it)
+
+    where ``rollback_extra`` is the mean wall-clock delta between rollback
+    and hit traces in the same optimized run. This reuses the existing
+    trace data; no extra benchmark runs are required.
+
+    The returned dict has the same shape as ``aggregate(...)`` so
+    ``print_mode(...)`` can display it without changes.
+    """
+    if not opt_traces:
+        return {}
+
+    rollback_traces = [t for t in opt_traces if t["rollbacks"] > 0]
+    hit_traces = [t for t in opt_traces if t["speculation_hits"] > 0]
+
+    if rollback_traces and hit_traces:
+        rollback_extra = max(
+            0.0,
+            statistics.mean(t["wall_ms"] for t in rollback_traces)
+            - statistics.mean(t["wall_ms"] for t in hit_traces),
+        )
+    else:
+        rollback_extra = 0.0
+
+    synth_walls = [
+        t["wall_ms"] + (rollback_extra if t["speculation_hits"] > 0 else 0)
+        for t in opt_traces
+    ]
+    if len(synth_walls) > 1:
+        wall_mean = statistics.mean(synth_walls)
+        wall_std = statistics.pstdev(synth_walls)
+    elif synth_walls:
+        wall_mean = float(synth_walls[0])
+        wall_std = 0.0
+    else:
+        wall_mean = wall_std = 0.0
+
+    # Bytes / RPC counts don't change in the always-expensive synthesis —
+    # only the wall-clock latency does. So we copy the optimized aggregate
+    # and override the wall fields.
+    base = aggregate(opt_traces)
+    base["wall_mean"] = wall_mean
+    base["wall_std"] = wall_std
+    base["rollback_extra_synth"] = rollback_extra
+    return base
+
+
+# ---------------------------------------------------------------------------
 # Formatting
 # ---------------------------------------------------------------------------
 
@@ -295,8 +356,15 @@ def main() -> None:
 
     basic_agg = aggregate(basics)
     opt_agg = aggregate(optims)
+    ae_agg = compute_always_expensive(optims)
     print_mode("BASIC", basic_agg)
     print_mode("OPTIMIZED", opt_agg)
+    if ae_agg:
+        print(f"ALWAYS-EXPENSIVE (synthetic — every speculation rolls back, "
+              f"derived from optimized + rollback_extra={ae_agg.get('rollback_extra_synth', 0):.0f}ms):")
+        print(f"  wall-clock latency:  "
+              f"{ae_agg['wall_mean']:.0f}ms ± {ae_agg['wall_std']:.0f}ms")
+        print()
 
     # Comparison table
     if basic_agg and opt_agg:
@@ -328,37 +396,47 @@ def main() -> None:
               f"tokens_wasted={opt_agg['tokens_wasted']}")
         print()
 
-        # Top-line speedup
+        # Top-line speedup — three-way (Basic vs Optimized vs always-expensive)
         lat_reduction = pct_reduction(basic_agg["wall_mean"], opt_agg["wall_mean"])
         byte_reduction = pct_reduction(basic_agg["bytes_mean"], opt_agg["bytes_mean"])
         rpc_reduction = pct_reduction(basic_agg["total_rpc"], opt_agg["total_rpc"])
         speedup = (basic_agg["wall_mean"] / max(opt_agg["wall_mean"], 1.0))
         print("=== Speedup ===")
-        print(f"  Latency:   {basic_agg['wall_mean']:.0f}ms -> "
-              f"{opt_agg['wall_mean']:.0f}ms  "
+        print(f"  Latency:   basic={basic_agg['wall_mean']:.0f}ms -> "
+              f"optimized={opt_agg['wall_mean']:.0f}ms  "
               f"({lat_reduction:.1f}% reduction, {speedup:.2f}x speedup)")
+        if ae_agg:
+            ae_speedup = ae_agg["wall_mean"] / max(opt_agg["wall_mean"], 1.0)
+            ae_reduction = pct_reduction(ae_agg["wall_mean"], opt_agg["wall_mean"])
+            print(f"             always-expensive={ae_agg['wall_mean']:.0f}ms -> "
+                  f"optimized={opt_agg['wall_mean']:.0f}ms  "
+                  f"({ae_reduction:.1f}% reduction vs always-expensive, "
+                  f"{ae_speedup:.2f}x)")
         print(f"  Bytes:     {fmt_bytes(basic_agg['bytes_mean'])} -> "
               f"{fmt_bytes(opt_agg['bytes_mean'])}  ({byte_reduction:.1f}% reduction)")
         print(f"  RPC calls: {basic_agg['total_rpc']} -> {opt_agg['total_rpc']}  "
               f"({rpc_reduction:.1f}% reduction)")
         print()
 
-        # E[C] under speculation = hit_rate * fast_path + (1-hit_rate) * (fast + rollback)
-        # We use the optimized wall-clock as the observed fast path and
-        # approximate rollback cost from the basic latency delta.
+        # E[C] under speculation
+        # E[C] = p*fast + (1-p)*(fast+rollback)
+        # observed_optimized ≈ E[C]; always_expensive = fast + rollback (worst).
         hit_rate = opt_agg["hit_rate"]
-        rollback_extra = max(0.0, opt_agg["wall_mean"] - basic_agg["wall_mean"])
-        expected_cost = opt_agg["wall_mean"]
+        rollback_extra = ae_agg.get("rollback_extra_synth", 0.0) if ae_agg else 0.0
         print("=== Speculation analysis (E[C]) ===")
         print(f"  hit_rate (p):             {hit_rate*100:.1f}%")
         print(f"  guard cost (g):           {opt_agg['guard_ms_mean']:.1f}ms")
-        print(f"  observed mean latency:    {opt_agg['wall_mean']:.0f}ms")
-        print(f"  rollback extra latency:   {rollback_extra:.0f}ms (approx)")
-        print(f"  E[C] = p*fast + (1-p)*(fast+rollback) = "
-              f"{expected_cost:.0f}ms observed")
+        print(f"  observed optimized E[C]:  {opt_agg['wall_mean']:.0f}ms")
+        print(f"  rollback extra latency:   {rollback_extra:.0f}ms")
+        if ae_agg:
+            saved = max(0.0, ae_agg["wall_mean"] - opt_agg["wall_mean"])
+            print(f"  always-expensive cost:    {ae_agg['wall_mean']:.0f}ms")
+            print(f"  speculation savings:      {saved:.0f}ms vs always-expensive "
+                  f"({pct_reduction(ae_agg['wall_mean'], opt_agg['wall_mean']):.1f}%)")
+        print(f"  basic (sequential):       {basic_agg['wall_mean']:.0f}ms")
         print()
-        print("Speculation is beneficial when guard_cost + (1-p)*rollback_cost < "
-              "serial_summarize_latency.")
+        print("Speculation is beneficial when "
+              "guard_cost + (1-p)*rollback_cost < serial_summarize_latency.")
     else:
         print("Not enough data to compare (need both basic and optimized runs).")
 

@@ -187,16 +187,95 @@ The rollback cases are what the course project's speculation analysis
 
 ## Measured performance
 
-TODO
+Numbers below are from 5 runs × 8 inputs = 40 traces per mode on the
+hardware listed in the next section. Reproduce with:
+
+```bash
+rm -f profiler_logs/code_review_exec_ops.jsonl
+python client/code_review/basic_client.py     --all --runs 5
+python client/code_review/optimized_client.py --all --runs 5
+python analysis/code_review/parse_and_compare.py
+```
+
+### Headline (Basic vs Optimized)
+
+| Metric                          | Basic       | Optimized | Reduction |
+|---------------------------------|-------------|-----------|-----------|
+| End-to-end latency (mean ± std) | 87 ± 14 ms  | 78 ± 4 ms | 10.4 %    |
+| Client RPC calls (total)        | 200         | 148       | 26.0 %    |
+| Bytes transferred (mean / trace)| 26.7 KB     | 6.7 KB    | 74.9 %    |
+
+End-to-end speedup: **1.12×**.
+
+### Per-optimization breakdown
+
+| Optimization  | Before    | After    | Effect                        |
+|---------------|-----------|----------|-------------------------------|
+| O1 round-trip (lint + scan request bytes)   | 479.6 KB | 94.1 KB | 80.4 % fewer request bytes |
+| O2 dead-output (lint + scan response bytes) | 23.5 KB  | 14.8 KB | 37.1 % fewer response bytes |
+| O3 redundant invocations                    | 40 duplicate (op, args_hash) pairs | 72 cache hits | second parse + cross-run repeats served locally |
+| O4 speculation                              | —        | 50 % hit rate | observed E[C] = 78 ms |
+
+Note: `ruff` and `bandit` subprocesses dominate wall-clock (~60–80 ms per
+invocation), so O1 and O2 show up primarily as byte-traffic savings rather
+than latency savings. O3 and O4 drive the latency win.
+
+### Speculation analysis (bonus)
+
+Three-way comparison of summarize-path policies, all measured on the same
+optimized run (40 traces, 50 % guard hit rate):
+
+| Policy                                | Latency (mean) | Notes |
+|---------------------------------------|---------------:|-------|
+| Basic (sequential wait-then-execute)  | 87 ms          | summarize serialized after lint + scan |
+| Optimized (speculation, observed E[C])| **78 ms**      | guard predicts; rollback only on miss |
+| Always-expensive (synthetic, every speculation rolls back) | 80 ms | Optimized + rollback_extra applied to every hit |
+
+- Guard hit rate (`p`): 50.0 %
+- Guard cost (`g`): < 1 ms (regex over source)
+- Rollback extra latency: ~5 ms (observed mean delta between rollback and hit traces)
+- Speculative tokens wasted across all rollbacks: 460
+- Speculation savings vs always-expensive: ~2 ms (2.9 %)
+- Speculation savings vs basic: ~9 ms (10.4 %)
+
+Speculation is beneficial when
+`guard_cost + (1 − p) · rollback_cost < serial_summarize_latency`. With
+the deterministic template backend, summarize cost is tiny (~1 ms) so the
+50 % guard barely moves the needle vs. always-expensive (~3 % win) but
+*does* still beat the sequential basic policy (~10 % win) because
+speculation also lifts summarize off the critical path. Under a real LLM
+backend the serial summarize cost is much larger (typically 100s of ms
+even for a 0.5 B model), so the same hit rate becomes a substantial
+end-to-end win.
 
 ## Hardware and reproducibility
 
-- CPU-only; tested on macOS with Python 3.10+. No GPU required.
-- Deterministic: all four tools (AST, ruff, bandit, TemplateBackend) are
-  deterministic for the same input; the only non-deterministic value per run
-  is the generated `trace_id`.
-- Logs are appended, not overwritten, so multiple runs combine in the same
-  JSONL. Delete the log or rotate it between experiments.
+Performance numbers in this README were measured on:
+
+- **OS**: macOS 15.6 (Darwin 24.x)
+- **CPU**: Apple M4 (arm64, 10 cores)
+- **RAM**: 16 GB unified memory
+- **Python**: 3.14.4
+- **Tool versions**: `ruff` 0.15.11, `bandit` 1.9.4, FastAPI / uvicorn from
+  `requirements.txt`
+
+The benchmark runs end-to-end on any CPU-only host with Python 3.10+.
+
+The summarizer's `--backend local` path requires a **CUDA-enabled GPU**
+plus the optional dependencies in `requirements-llm.txt`. On any host
+without CUDA — including Apple Silicon (M1–M4), where PyTorch uses MPS
+rather than CUDA — `LocalLLMBackend` transparently falls back to
+`TemplateBackend` and the EXEC_OP record carries
+`extra.llm_fallback_reason`. The deterministic `template` backend is the
+default, so no GPU is needed to reproduce the headline numbers.
+
+Determinism notes:
+
+- All four tools (AST, ruff, bandit, TemplateBackend) are deterministic
+  for the same input; the only non-deterministic value per run is the
+  generated `trace_id`.
+- Logs are appended, not overwritten, so multiple runs combine in the
+  same JSONL. Delete the log or rotate it between experiments.
 
 ## EXEC_OP extensions used in this benchmark
 
@@ -213,11 +292,38 @@ schema. This benchmark also uses these `extra` fields:
   server-side by linter / scanner so the analyzer can attribute bytes saved
   to O1 and O2.
 
-## Filling in the LLM
+## LLM backend (optional)
 
-`server/code_review/llm_backend.py` houses both backends.
-`TemplateBackend` is the deterministic default; `LocalLLMBackend` contains a
-TODO-marked sketch (model load, tokenize, `model.generate(...)`) for a small
-local model such as `Qwen/Qwen2.5-Coder-0.5B-Instruct`. No other file needs
-to change to swap backends — select via
-`summarizer_server.py --backend local`.
+`server/code_review/llm_backend.py` provides two backends behind the same
+`generate_review(...)` interface:
+
+- **`TemplateBackend`** — deterministic, zero-dependency default. Runs
+  everywhere, no GPU required.
+- **`LocalLLMBackend`** — runs a small open-source instruct model
+  (`Qwen/Qwen2.5-Coder-0.5B-Instruct` by default) on a CUDA device.
+  Detects CUDA at construction time via `has_cuda()`, lazy-loads the
+  model on first use, and on any failure (no CUDA, missing torch /
+  transformers, model download error, generation OOM) silently delegates
+  to `TemplateBackend`. The model ID is overridable without editing the
+  file:
+
+      export CODE_REVIEW_LLM_MODEL="Qwen/Qwen2.5-Coder-1.5B-Instruct"
+
+Select the backend at startup:
+
+```bash
+python server/code_review/summarizer_server.py --port 8104 --backend local
+# or, for the deterministic default
+python server/code_review/summarizer_server.py --port 8104 --backend template
+```
+
+To enable real model inference on a CUDA host:
+
+```bash
+pip install -r requirements-llm.txt   # transformers, torch, accelerate
+python server/code_review/summarizer_server.py --port 8104 --backend local
+```
+
+`requirements-llm.txt` is intentionally separate from base
+`requirements.txt` so the benchmark stays installable on hosts without
+GPU support.
